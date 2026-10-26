@@ -31,6 +31,8 @@ include the Milestone 1 pipeline file in the repository root.
 	class weights. Multinomial routing is enabled with `multi_class=True`.
 - `StratifiedKFold` with accuracy scoring for classification.
 - `KFold` with $R^2$ scoring for regression.
+- Fold-local preprocessing pipelines that fit categorical encoders inside each
+	cross-validation training fold to prevent preprocessing leakage.
 - Cost-complexity pruning through `cost_complexity_pruning_path()`.
 - Fit diagnostics that log overfitting when the train score exceeds the
 	validation score by more than 15%, and underfitting when both scores are

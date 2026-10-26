@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -13,6 +12,7 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.metrics import get_scorer
 from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.base import clone
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor, plot_tree
 
@@ -37,11 +37,28 @@ LOGGER = logging.getLogger(__name__)
 class KhethaBaselineEngine:
     """Build and validate interpretable baseline models."""
 
-    def __init__(self, X_train, y_train, X_test, y_test, task_type):
+    def __init__(self, X_train, y_train, X_test, y_test, task_type, preprocessor=None):
         self.X_train, self.y_train = X_train, y_train
         self.X_test, self.y_test = X_test, y_test
         self.task_type = task_type.lower()
+        self.preprocessor = preprocessor
         self.best_model = None
+
+    def _fit_features(self):
+        if self.preprocessor is None:
+            return self.X_train
+        self.preprocessor.fit(self.X_train, self.y_train)
+        return self.preprocessor.transform(self.X_train)
+
+    def _cv_model(self, model):
+        if self.preprocessor is None or isinstance(model, Pipeline):
+            return model
+        return Pipeline([("preprocessor", clone(self.preprocessor)), ("model", model)])
+
+    def _model_features(self, X):
+        if self.preprocessor is None:
+            return X
+        return self.preprocessor.transform(X)
 
     @property
     def is_classification(self):
@@ -56,7 +73,7 @@ class KhethaBaselineEngine:
             model = DecisionTreeRegressor(max_depth=max_depth, ccp_alpha=ccp_alpha, random_state=42)
         else:
             raise ValueError("task_type must be classification or regression")
-        model.fit(self.X_train, self.y_train)
+        model.fit(self._fit_features(), self.y_train)
         self.best_model = model
         return model
 
@@ -68,7 +85,7 @@ class KhethaBaselineEngine:
         if multi_class:
             kwargs["multi_class"] = "multinomial"
         model = LogisticRegression(**kwargs)
-        model.fit(self.X_train, self.y_train)
+        model.fit(self._fit_features(), self.y_train)
         self.best_model = model
         return model
 
@@ -89,7 +106,7 @@ class KhethaBaselineEngine:
                 raise ValueError("At least two samples are required for cross-validation")
             cv = KFold(n_splits=folds, shuffle=True, random_state=42)
             scoring = "r2"
-        scores = cross_val_score(model, self.X_train, self.y_train, cv=cv, scoring=scoring)
+        scores = cross_val_score(self._cv_model(model), self.X_train, self.y_train, cv=cv, scoring=scoring)
         return {"mean": float(scores.mean()), "std": float(scores.std()), "scores": scores}
 
     def control_tree_complexity(self, max_candidates=10):
@@ -100,7 +117,7 @@ class KhethaBaselineEngine:
             base = DecisionTreeClassifier(random_state=42)
         else:
             base = DecisionTreeRegressor(random_state=42)
-        path = base.cost_complexity_pruning_path(self.X_train, self.y_train)
+        path = base.cost_complexity_pruning_path(self._fit_features(), self.y_train)
         alphas = np.unique(path.ccp_alphas)
         if len(alphas) > max_candidates:
             indexes = np.linspace(0, len(alphas) - 1, max_candidates, dtype=int)
@@ -120,7 +137,10 @@ class KhethaBaselineEngine:
         """Create and return a plot showing the first three tree levels."""
         if plt is None:
             raise ImportError("visualize_top_splits requires matplotlib")
-        feature_names = list(getattr(self.X_train, "columns", [])) or None
+        if self.preprocessor is not None and hasattr(self.preprocessor, "get_feature_names_out"):
+            feature_names = list(self.preprocessor.get_feature_names_out())
+        else:
+            feature_names = list(getattr(self.X_train, "columns", [])) or None
         fig, axis = plt.subplots(figsize=(18, 9))
         plot_tree(model, max_depth=max_depth, feature_names=feature_names, filled=True, ax=axis)
         axis.set_title("Khetha baseline decision tree: top splits")
@@ -132,8 +152,8 @@ class KhethaBaselineEngine:
         model = model or self.best_model
         if model is None:
             raise ValueError("A fitted model is required for diagnostics")
-        train_score = float(model.score(self.X_train, self.y_train))
-        validation_score = float(model.score(self.X_test, self.y_test))
+        train_score = float(model.score(self._model_features(self.X_train), self.y_train))
+        validation_score = float(model.score(self._model_features(self.X_test), self.y_test))
         if train_score - validation_score > 0.15:
             LOGGER.warning("Potential overfitting: train score %.3f exceeds validation score %.3f by more than 15%%", train_score, validation_score)
         if train_score < 0.7 and validation_score < 0.7:
@@ -150,14 +170,13 @@ def _load_milestone_one_output(data_dir: Path, target_col: str, key_features):
     return pipeline.run(target_col, key_features)
 
 
-def _encode_train_test(X_train, X_test):
+def _make_preprocessor(X_train):
     categorical = X_train.select_dtypes(include=["object", "bool"]).columns.tolist()
     numeric = [column for column in X_train.columns if column not in categorical]
-    transformer = ColumnTransformer(
+    return ColumnTransformer(
         [("categorical", OneHotEncoder(handle_unknown="ignore"), categorical), ("numeric", "passthrough", numeric)],
         remainder="drop",
     )
-    return transformer.fit_transform(X_train), transformer.transform(X_test)
 
 
 def _claims_features(data_dir: Path):
@@ -176,7 +195,7 @@ def _claims_features(data_dir: Path):
         [("categorical", OneHotEncoder(handle_unknown="ignore"), categorical), ("numeric", "passthrough", numeric)],
         remainder="drop",
     )
-    return features, target, claims["claim_amount"], transformer
+    return features, target, claims["claim_amount"]
 
 
 def main():
@@ -187,13 +206,13 @@ def main():
     if fraud_output is not None and cost_output is not None:
         LOGGER.info("Using X_train, X_test, y_train, and y_test from khetha_data_pipeline.py")
         fraud_X_train, fraud_X_test, y_train, y_test = fraud_output
-        X_train, X_test = _encode_train_test(fraud_X_train, fraud_X_test)
+        fraud_preprocessor = _make_preprocessor(fraud_X_train)
     else:
         LOGGER.info("Milestone 1 pipeline unavailable; using local claims preparation fallback")
-        features, fraud_target, cost_target, transformer = _claims_features(data_dir)
-        encoded = transformer.fit_transform(features)
-        X_train, X_test, y_train, y_test = train_test_split(encoded, fraud_target, test_size=0.2, random_state=42, stratify=fraud_target)
-    fraud_engine = KhethaBaselineEngine(X_train, y_train, X_test, y_test, "classification")
+        features, fraud_target, cost_target = _claims_features(data_dir)
+        fraud_X_train, fraud_X_test, y_train, y_test = train_test_split(features, fraud_target, test_size=0.2, random_state=42, stratify=fraud_target)
+        fraud_preprocessor = _make_preprocessor(fraud_X_train)
+    fraud_engine = KhethaBaselineEngine(fraud_X_train, y_train, fraud_X_test, y_test, "classification", fraud_preprocessor)
     fraud_tree = fraud_engine.build_tree_baseline(max_depth=5)
     LOGGER.info("Fraud tree CV: %s", fraud_engine.run_cross_validation(fraud_tree))
     fraud_engine.diagnose_fit(fraud_tree)
@@ -202,19 +221,19 @@ def main():
 
     if cost_output is not None:
         cost_X_train, cost_X_test, target_train, target_test = cost_output
-        cost_train, cost_test = _encode_train_test(cost_X_train, cost_X_test)
+        cost_preprocessor = _make_preprocessor(cost_X_train)
     else:
-        cost_train, cost_test, target_train, target_test = train_test_split(features, cost_target, test_size=0.2, random_state=42)
-        cost_train = transformer.fit_transform(cost_train)
-        cost_test = transformer.transform(cost_test)
-    cost_engine = KhethaBaselineEngine(cost_train, target_train, cost_test, target_test, "regression")
-    linear = Pipeline([("model", LinearRegression())])
-    linear.fit(cost_train, target_train)
+        cost_X_train, cost_X_test, target_train, target_test = train_test_split(features, cost_target, test_size=0.2, random_state=42)
+        cost_preprocessor = _make_preprocessor(cost_X_train)
+    cost_engine = KhethaBaselineEngine(cost_X_train, target_train, cost_X_test, target_test, "regression", cost_preprocessor)
+    linear = Pipeline([("preprocessor", clone(cost_preprocessor)), ("model", LinearRegression())])
+    linear.fit(cost_X_train, target_train)
     tree = cost_engine.build_tree_baseline(max_depth=6)
     LOGGER.info("Claim cost linear CV: %s", cost_engine.run_cross_validation(linear))
     LOGGER.info("Claim cost tree CV: %s", cost_engine.run_cross_validation(tree))
     cost_engine.diagnose_fit(tree)
-    cost_engine.control_tree_complexity()
+    best_alpha, _ = cost_engine.control_tree_complexity()
+    LOGGER.info("Selected claim-cost tree ccp_alpha: %.8f", best_alpha)
 
 
 if __name__ == "__main__":
