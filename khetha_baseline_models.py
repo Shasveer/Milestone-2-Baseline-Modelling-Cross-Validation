@@ -64,13 +64,23 @@ class KhethaBaselineEngine:
     def is_classification(self):
         return self.task_type in {"classification", "class", "fraud", "binary", "multiclass"}
 
-    def build_tree_baseline(self, task_type=None, max_depth=None, ccp_alpha=0.0):
+    def build_tree_baseline(self, task_type=None, max_depth=None, min_samples_split=2, ccp_alpha=0.0):
         """Fit a classifier or regressor with explicit complexity controls."""
         selected_task = (task_type or self.task_type).lower()
         if selected_task in {"classification", "class", "fraud", "binary", "multiclass"}:
-            model = DecisionTreeClassifier(max_depth=max_depth, ccp_alpha=ccp_alpha, random_state=42)
+            model = DecisionTreeClassifier(
+                max_depth=max_depth,
+                min_samples_split=min_samples_split,
+                ccp_alpha=ccp_alpha,
+                random_state=42,
+            )
         elif selected_task in {"regression", "regressor", "claim_cost", "cost"}:
-            model = DecisionTreeRegressor(max_depth=max_depth, ccp_alpha=ccp_alpha, random_state=42)
+            model = DecisionTreeRegressor(
+                max_depth=max_depth,
+                min_samples_split=min_samples_split,
+                ccp_alpha=ccp_alpha,
+                random_state=42,
+            )
         else:
             raise ValueError("task_type must be classification or regression")
         model.fit(self._fit_features(), self.y_train)
@@ -110,7 +120,7 @@ class KhethaBaselineEngine:
         return {"mean": float(scores.mean()), "std": float(scores.std()), "scores": scores}
 
     def control_tree_complexity(self, max_candidates=10):
-        """Select a pruning alpha using the tree's cost-complexity path."""
+        """Select tree complexity controls with cross-validation."""
         if max_candidates < 1:
             raise ValueError("max_candidates must be positive")
         if self.is_classification:
@@ -123,15 +133,32 @@ class KhethaBaselineEngine:
             indexes = np.linspace(0, len(alphas) - 1, max_candidates, dtype=int)
             alphas = alphas[indexes]
 
-        validation_scores = []
-        for alpha in alphas:
-            candidate = self.build_tree_baseline(ccp_alpha=float(alpha))
-            validation_scores.append(self.run_cross_validation(candidate)["mean"])
-        best_index = int(np.argmax(validation_scores))
-        best_alpha = float(alphas[best_index])
-        best_model = self.build_tree_baseline(ccp_alpha=best_alpha)
+        max_depths = [None, 5, 10]
+        min_samples_splits = [2, 10, 20]
+        candidates = []
+        for max_depth in max_depths:
+            for min_samples_split in min_samples_splits:
+                for alpha in alphas:
+                    candidate = self.build_tree_baseline(
+                        max_depth=max_depth,
+                        ccp_alpha=float(alpha),
+                        min_samples_split=min_samples_split,
+                    )
+                    candidates.append(
+                        (self.run_cross_validation(candidate)["mean"], max_depth, min_samples_split, float(alpha))
+                    )
+        _, best_depth, best_split, best_alpha = max(candidates, key=lambda item: item[0])
+        best_model = self.build_tree_baseline(
+            max_depth=best_depth,
+            ccp_alpha=best_alpha,
+            min_samples_split=best_split,
+        )
         self.best_model = best_model
-        return best_alpha, best_model
+        return {
+            "max_depth": best_depth,
+            "min_samples_split": best_split,
+            "ccp_alpha": best_alpha,
+        }, best_model
 
     def visualize_top_splits(self, model, max_depth=3):
         """Create and return a plot showing the first three tree levels."""
@@ -181,8 +208,9 @@ def _make_preprocessor(X_train):
 
 def _claims_features(data_dir: Path):
     claims = pd.read_csv(data_dir / "claims_data.csv")
-    risk_path = data_dir / "geographic_risk.csv"
-    if risk_path.exists():
+    risk_paths = [data_dir / "geographic_risks.csv", data_dir / "geographic_risk.csv"]
+    risk_path = next((path for path in risk_paths if path.exists()), None)
+    if risk_path is not None:
         risk = pd.read_csv(risk_path).groupby("province", as_index=False)[
             ["crime_score", "hijacking_rate_per_10k", "weather_risk_score", "avg_claim_cost_zar", "fraud_rate_historical"]
         ].mean()
@@ -213,11 +241,17 @@ def main():
         fraud_X_train, fraud_X_test, y_train, y_test = train_test_split(features, fraud_target, test_size=0.2, random_state=42, stratify=fraud_target)
         fraud_preprocessor = _make_preprocessor(fraud_X_train)
     fraud_engine = KhethaBaselineEngine(fraud_X_train, y_train, fraud_X_test, y_test, "classification", fraud_preprocessor)
-    fraud_tree = fraud_engine.build_tree_baseline(max_depth=5)
-    LOGGER.info("Fraud tree CV: %s", fraud_engine.run_cross_validation(fraud_tree))
-    fraud_engine.diagnose_fit(fraud_tree)
+    fraud_default_tree = fraud_engine.build_tree_baseline()
+    LOGGER.info("Fraud default tree CV: %s", fraud_engine.run_cross_validation(fraud_default_tree))
+    fraud_engine.diagnose_fit(fraud_default_tree)
     if plt is not None:
-        fraud_engine.visualize_top_splits(fraud_tree).savefig(data_dir / "khetha_tree_splits.png")
+        fraud_engine.visualize_top_splits(fraud_default_tree).savefig(data_dir / "khetha_tree_splits.png")
+    fraud_logistic = fraud_engine.build_logistic_baseline()
+    LOGGER.info("Fraud logistic regression CV: %s", fraud_engine.run_cross_validation(fraud_logistic))
+    fraud_config, fraud_tree = fraud_engine.control_tree_complexity()
+    LOGGER.info("Selected fraud tree configuration: %s", fraud_config)
+    LOGGER.info("Fraud controlled tree CV: %s", fraud_engine.run_cross_validation(fraud_tree))
+    fraud_engine.diagnose_fit(fraud_tree)
 
     if cost_output is not None:
         cost_X_train, cost_X_test, target_train, target_test = cost_output
@@ -228,12 +262,14 @@ def main():
     cost_engine = KhethaBaselineEngine(cost_X_train, target_train, cost_X_test, target_test, "regression", cost_preprocessor)
     linear = Pipeline([("preprocessor", clone(cost_preprocessor)), ("model", LinearRegression())])
     linear.fit(cost_X_train, target_train)
-    tree = cost_engine.build_tree_baseline(max_depth=6)
+    tree = cost_engine.build_tree_baseline()
+    LOGGER.info("Claim cost default tree CV: %s", cost_engine.run_cross_validation(tree))
     LOGGER.info("Claim cost linear CV: %s", cost_engine.run_cross_validation(linear))
-    LOGGER.info("Claim cost tree CV: %s", cost_engine.run_cross_validation(tree))
     cost_engine.diagnose_fit(tree)
-    best_alpha, _ = cost_engine.control_tree_complexity()
-    LOGGER.info("Selected claim-cost tree ccp_alpha: %.8f", best_alpha)
+    cost_config, controlled_tree = cost_engine.control_tree_complexity()
+    LOGGER.info("Selected claim-cost tree configuration: %s", cost_config)
+    LOGGER.info("Claim cost controlled tree CV: %s", cost_engine.run_cross_validation(controlled_tree))
+    cost_engine.diagnose_fit(controlled_tree)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ data before advanced model tuning. The implementation is in
 - `claims_data.csv`: claim-level modelling data, including `fraud_label` and
 	`claim_amount` targets.
 - `fraud_labels.csv`, `vehicles.csv`, `policyholders.csv`, and
-	`geographic_risk.csv`: supporting Milestone 1 data sources.
+	`geographic_risks.csv`: supporting Milestone 1 data sources.
 - `config.json`: Khetha thresholds and South African domain configuration.
 
 The baseline module imports `KhethaDataPipeline` from Milestone 1 and calls its
@@ -71,11 +71,14 @@ python khetha_baseline_models.py
 The script will:
 
 1. Load and split fraud data through the Milestone 1 pipeline.
-2. Train and cross-validate a constrained fraud decision tree.
+2. Train and cross-validate a default fraud decision tree, logistic regression,
+	and a complexity-controlled fraud decision tree.
 3. Generate `khetha_tree_splits.png` when matplotlib is available.
 4. Load and split claim-cost data through the Milestone 1 pipeline.
-5. Compare linear regression and a decision-tree regressor.
-6. Tune a pruned tree and emit fit diagnostics through the logger.
+5. Compare linear regression and default and complexity-controlled decision-tree
+	regressors.
+6. Tune `max_depth`, `min_samples_split`, and `ccp_alpha`, then emit fit
+	diagnostics through the logger.
 
 The generated PNG is a review artifact and is not required for importing the
 engine in another Python module.
@@ -92,7 +95,8 @@ diagnostics = engine.diagnose_fit(tree)
 ```
 
 For regression, pass `task_type="regression"`. `control_tree_complexity()`
-returns `(best_ccp_alpha, best_model)` after evaluating pruning candidates.
+returns `(best_configuration, best_model)` after evaluating combinations of
+`max_depth`, `min_samples_split`, and `ccp_alpha`.
 
 ## Verification
 
